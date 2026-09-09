@@ -8,3 +8,6 @@
 
 ### Amber Rastella
 > I'm a student in Boston University's Master of Science in Software Development (MSSD) program. I earned my BA in Computer Science with a minor in Psychology from the University of Rhode Island in December 2023, and I currently work as an Associate Software Developer at RIHousing, where I focus primarily on AI projects and automation work. Outside of school and work, I've been building toward game development using engines like Godot, along with Blender and Aseprite for art.
+
+### Mateus Silva
+> I'm Mateus, and I'm enrolled in the MS in Software Development program at Boston University. I graduated with a BS in Computer Science at Brandeis University in May 2023, and I'm currently working as a Customer Support Specialist at SAP, a software company that specializes in business processes and enterprise architecture software. In my free time, I enjoy playing video games, and going on walks with my dog. I've made a few personal web apps in the past, primarily using frameworks like ExpressJS and React.
