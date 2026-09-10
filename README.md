@@ -7,11 +7,11 @@ This is an organizational inventory management/checkout service. The motivation 
 The goal is to create a full-stack web application that will allow organizations to create their own inventory portals, with an interface allowing organization members to request and check out equipment, as well as an admin dashboard for managing the inventory and viewing the audit log.
 
 ## Team Members
-Alexa Stein - Team Lead
-Amber Rastella - Security
-Alex Picard - Configuration
-Mateus Silva - Requirements
-Orelmis Toribio - QA
+Alexa Stein - Team Lead  
+Amber Rastella - Security  
+Alex Picard - Configuration  
+Mateus Silva - Requirements  
+Orelmis Toribio - QA  
 
 ## Tech Stack
 
