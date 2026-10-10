@@ -1,7 +1,7 @@
 // AI-USAGE SUMMARY
 // Tools: Claude Code
 // Overall AI Contribution: ~90% (skeleton generated from team design documents)
-// AI-Assisted Areas: SCRUM-148 submit() asks the approval policy and can create a request APPROVED (unit HELD); the single F4 state-transition table + assertTransition guard with unit side-effects; submit()/approve()/deny()/cancel()/list()/get() implemented; submit() now reserves the unit (AVAILABLE -> REQUESTED) with a compare-and-set, and deny()/cancel() release it back; submit() now enforces restricted-equipment eligibility via group.service.isActiveMember (SCRUM-149); submit() and approve() both check group.service.isEligible over allowedGroupIds (SCRUM-150, AT-3); SCRUM-205 custody confirmation: borrower-recorded pickup, initiateReturn/rejectReturn, canConfirmReturn on every return path, expireApprovals with a system-actor audit entry
+// AI-Assisted Areas: SCRUM-148 submit() asks the approval policy and can create a request APPROVED (unit HELD); the single F4 state-transition table + assertTransition guard with unit side-effects; submit()/approve()/deny()/cancel()/list()/get() implemented; submit() now reserves the unit (AVAILABLE -> REQUESTED) with a compare-and-set, and deny()/cancel() release it back; submit() now enforces restricted-equipment eligibility via group.service.isActiveMember (SCRUM-149); submit() and approve() both check group.service.isEligible over allowedGroupIds (SCRUM-150, AT-3); SCRUM-205 custody confirmation: borrower-recorded pickup, initiateReturn/rejectReturn, canConfirmReturn on every return path, expireApprovals with a system-actor audit entry; SCRUM-225 refactor: Extract Function on the duplicated handler preamble (loadRequest/loadOwnRequest/isRequester, assertMayDecide) and on the compare-and-set (commitTransition) — no behaviour change
 // Human Contributions: reviewed by Amber Rastella (PR #7, 2026-09-18); reviewed and approved by Amber Rastella (PR #7, 2026-09-18); latest changes reviewed and approved by Mateus Silva (PR #64, 2026-10-04); CI passed on merge: lint, format, unit + integration tests, npm audit, Docker build, CodeQL
 // Notes: Generated from SDD v0.1, SPPP, NFR doc, Sprint 1 backlog.
 
@@ -28,6 +28,13 @@
  * leaves the unit OUT. `returnUnit` and `rejectReturn` close or refuse it, and both ask the policy's
  * `canConfirmReturn`, so nobody confirms their own return unless nobody else could.
  * `expireApprovals` frees units whose approval nobody collected.
+ *
+ * Every handler is assembled from the same four private steps, which sit together above `submit`:
+ * `loadRequest`/`loadOwnRequest` read the request or refuse with 404, `assertMayDecide` and
+ * `assertMayConfirmReturn` ask the policy who may act, and `commitTransition` performs the
+ * compare-and-set. They exist once rather than once per handler, so the 404-not-403 rule, the
+ * separation-of-duties check and the race handling each have a single definition to read and to
+ * change (SCRUM-225).
  *
  * Exports: `TRANSITIONS`, `TERMINAL_STATES`, `assertTransition`, `canTransition`, and the handlers
  * `submit`, `list`, `get`, `approve`, `deny`, `cancel`, `checkout`, `initiateReturn`, `returnUnit`,
@@ -171,6 +178,114 @@ export function assertTransition(from, to) {
  */
 export function canTransition(from, to) {
   return Object.hasOwn(TRANSITIONS, from) && Object.hasOwn(TRANSITIONS[from], to);
+}
+
+/**
+ * Is `actor` the person who opened `request`?
+ *
+ * Both sides are stringified before comparing: `requesterId` is an ObjectId read from the document
+ * while `userId` is a string lifted off the access token, and those are never `===` even when they
+ * name the same person.
+ * @param {object} request
+ * @param {{ userId: string }} actor
+ * @returns {boolean}
+ */
+function isRequester(request, actor) {
+  return String(request.requesterId) === String(actor.userId);
+}
+
+/**
+ * Read a request, or refuse with 404 — the first line of almost every handler below.
+ *
+ * A request belonging to another organisation is already invisible here, because the repository
+ * scopes the read by tenant; it arrives as `null` and is reported as missing, not forbidden (SR-2).
+ * @param {string} orgId
+ * @param {string} requestId
+ * @returns {Promise<object>}
+ * @throws {NotFoundError} (404) no such request in this organisation
+ */
+async function loadRequest(orgId, requestId) {
+  const request = await checkoutRequestRepo.findById(orgId, requestId);
+  if (!request) {
+    throw new NotFoundError('Request not found');
+  }
+  return request;
+}
+
+/**
+ * Read one of the actor's *own* requests, or refuse with 404.
+ *
+ * For the handlers the requester alone may use (`cancel`, `initiateReturn`). Someone else's request
+ * is reported as missing rather than forbidden: those routes are open to every member, so a 403 would
+ * let a member learn which ids exist simply by probing them (SR-2).
+ * @param {string} orgId
+ * @param {{ userId: string }} actor
+ * @param {string} requestId
+ * @returns {Promise<object>}
+ * @throws {NotFoundError} (404) no such request, or the caller is not its requester
+ */
+async function loadOwnRequest(orgId, actor, requestId) {
+  const request = await loadRequest(orgId, requestId);
+  if (!isRequester(request, actor)) {
+    throw new NotFoundError('Request not found');
+  }
+  return request;
+}
+
+/**
+ * Refuse with 403 unless the organisation's approval policy lets `actor` decide this request.
+ *
+ * Separation of duties (SDD §6.4) is the policy's call, asked before anything is written. The
+ * approve/deny counterpart of `assertMayConfirmReturn`, which does the same for the return pair.
+ * @param {string} orgId
+ * @param {object} request
+ * @param {{ userId: string, role: string }} actor
+ * @returns {Promise<void>}
+ * @throws {ForbiddenError} (403) the actor's role can't decide, or the actor is the requester
+ */
+async function assertMayDecide(orgId, request, actor) {
+  const org = await organizationRepo.findById(orgId);
+  const decision = policyFor(org).canDecide(request, actor);
+  if (!decision.allowed) {
+    throw new ForbiddenError(decision.reason ?? 'Not allowed to decide this request');
+  }
+}
+
+/**
+ * Write the state change as a compare-and-set, or throw because someone else got there first.
+ *
+ * The move itself, shared by every handler. `expectedState` is re-checked at the database rather than
+ * trusted from the handler's earlier read, so two callers racing to decide one request cannot both
+ * win: the loser's update matches no document and is reported as a conflict.
+ *
+ * `to` is the only place the target state is named — it goes into the patch *and* into the error — so
+ * the write and the message it fails with cannot drift apart. `expectedState` stays an explicit
+ * argument rather than being inferred from the state already read: it is the handler's own statement
+ * of which source state it will move from, and a row added to `TRANSITIONS` later must not quietly
+ * widen that.
+ * @param {string} orgId
+ * @param {string} requestId
+ * @param {{ from: string, to: string, expectedState: string, patch?: object, conflictMessage?: string }} move
+ *   `from` is the state read before the transaction, named in the error for the client; `patch` is
+ *   merged over `{ state: to }`; `conflictMessage` replaces the state-machine wording where a handler
+ *   has something plainer to say about losing the race
+ * @param {{ session?: import('mongoose').ClientSession }} [options]
+ * @returns {Promise<object>} the updated request
+ * @throws {ConflictError} (409) when `conflictMessage` is given and the request had moved on
+ * @throws {StateTransitionError} (409) otherwise, when the request was no longer in `expectedState`
+ */
+async function commitTransition(orgId, requestId, move, { session } = {}) {
+  const { from, to, expectedState, patch, conflictMessage } = move;
+  const updated = await checkoutRequestRepo.transition(
+    orgId,
+    requestId,
+    { expectedState, patch: { state: to, ...patch } },
+    { session },
+  );
+  if (!updated) {
+    throw conflictMessage ? new ConflictError(conflictMessage) : new StateTransitionError(from, to);
+  }
+  return updated;
 }
 
 /**
@@ -425,9 +540,9 @@ async function withSummaries(orgId, items) {
  * @throws {NotFoundError} (404) when no such request is visible to this caller
  */
 export async function get(orgId, actor, requestId) {
-  const request = await checkoutRequestRepo.findById(orgId, requestId);
+  const request = await loadRequest(orgId, requestId);
   const maySeeAny = roleHasPermission(actor.role, PERMISSIONS.REQUESTS_DECIDE);
-  if (!request || (!maySeeAny && String(request.requesterId) !== String(actor.userId))) {
+  if (!maySeeAny && !isRequester(request, actor)) {
     throw new NotFoundError('Request not found');
   }
 
@@ -476,8 +591,8 @@ const CONFIRMER_ROLES = Object.freeze(
  */
 async function returnConfirmation(orgId, request, actor, { session } = {}) {
   const org = await organizationRepo.findById(orgId, { session });
-  const isRequester = String(request.requesterId) === String(actor.userId);
-  const otherConfirmers = isRequester
+  const actorIsRequester = isRequester(request, actor);
+  const otherConfirmers = actorIsRequester
     ? await userRepo.countActiveWithRoles(orgId, CONFIRMER_ROLES, {
         excludeUserId: actor.userId,
         session,
@@ -558,16 +673,8 @@ function timelineOf(request) {
  * @throws {StateTransitionError} (409) the request isn't PENDING (including a lost race)
  */
 export async function approve(orgId, actor, requestId, input = {}) {
-  const request = await checkoutRequestRepo.findById(orgId, requestId);
-  if (!request) {
-    throw new NotFoundError('Request not found');
-  }
-
-  const org = await organizationRepo.findById(orgId);
-  const decision = policyFor(org).canDecide(request, actor);
-  if (!decision.allowed) {
-    throw new ForbiddenError(decision.reason ?? 'Not allowed to decide this request');
-  }
+  const request = await loadRequest(orgId, requestId);
+  await assertMayDecide(orgId, request, actor);
 
   const { unitStatus } = assertTransition(request.state, S.APPROVED);
 
@@ -578,13 +685,15 @@ export async function approve(orgId, actor, requestId, input = {}) {
       throw new ConflictError('requester is no longer eligible');
     }
 
-    const updated = await checkoutRequestRepo.transition(
+    // Someone else deciding this request between our read and this write loses the compare-and-set.
+    const updated = await commitTransition(
       orgId,
       requestId,
       {
+        from: request.state,
+        to: S.APPROVED,
         expectedState: S.PENDING,
         patch: {
-          state: S.APPROVED,
           decidedBy: actor.userId,
           decidedAt: new Date(),
           decisionNote: input.note ?? '',
@@ -592,10 +701,6 @@ export async function approve(orgId, actor, requestId, input = {}) {
       },
       { session },
     );
-    if (!updated) {
-      // Someone else decided this request between our read and this write.
-      throw new StateTransitionError(request.state, S.APPROVED);
-    }
 
     await assetUnitRepo.updateStatus(orgId, updated.unitId, unitStatus, { session });
 
@@ -634,27 +739,20 @@ export async function approve(orgId, actor, requestId, input = {}) {
  * @throws {StateTransitionError} (409) the request isn't PENDING (including a lost race)
  */
 export async function deny(orgId, actor, requestId, input = {}) {
-  const request = await checkoutRequestRepo.findById(orgId, requestId);
-  if (!request) {
-    throw new NotFoundError('Request not found');
-  }
-
-  const org = await organizationRepo.findById(orgId);
-  const decision = policyFor(org).canDecide(request, actor);
-  if (!decision.allowed) {
-    throw new ForbiddenError(decision.reason ?? 'Not allowed to decide this request');
-  }
+  const request = await loadRequest(orgId, requestId);
+  await assertMayDecide(orgId, request, actor);
 
   const { unitStatus } = assertTransition(request.state, S.DENIED);
 
   return withTransaction(async (session) => {
-    const updated = await checkoutRequestRepo.transition(
+    const updated = await commitTransition(
       orgId,
       requestId,
       {
+        from: request.state,
+        to: S.DENIED,
         expectedState: S.PENDING,
         patch: {
-          state: S.DENIED,
           decidedBy: actor.userId,
           decidedAt: new Date(),
           decisionNote: input.note ?? '',
@@ -662,9 +760,6 @@ export async function deny(orgId, actor, requestId, input = {}) {
       },
       { session },
     );
-    if (!updated) {
-      throw new StateTransitionError(request.state, S.DENIED);
-    }
 
     await assetUnitRepo.updateStatus(orgId, updated.unitId, unitStatus, { session });
 
@@ -712,26 +807,21 @@ export async function deny(orgId, actor, requestId, input = {}) {
  * @throws {StateTransitionError} (409) the request isn't PENDING/APPROVED (including a lost race)
  */
 export async function cancel(orgId, actor, requestId, input = {}) {
-  const request = await checkoutRequestRepo.findById(orgId, requestId);
-  if (!request || String(request.requesterId) !== String(actor.userId)) {
-    throw new NotFoundError('Request not found');
-  }
+  const request = await loadOwnRequest(orgId, actor, requestId);
 
   const { unitStatus } = assertTransition(request.state, S.CANCELLED);
 
   return withTransaction(async (session) => {
-    const updated = await checkoutRequestRepo.transition(
+    const updated = await commitTransition(
       orgId,
       requestId,
       {
+        from: request.state,
+        to: S.CANCELLED,
         expectedState: request.state,
-        patch: { state: S.CANCELLED },
       },
       { session },
     );
-    if (!updated) {
-      throw new StateTransitionError(request.state, S.CANCELLED);
-    }
 
     if (unitStatus) {
       await assetUnitRepo.updateStatus(orgId, updated.unitId, unitStatus, { session });
@@ -790,13 +880,10 @@ const ALREADY_OUT_STATES = Object.freeze([S.CHECKED_OUT, S.OVERDUE, S.RETURN_PEN
  * @throws {StateTransitionError} (409) the request is in some other state that cannot be checked out
  */
 export async function checkout(orgId, actor, requestId, input = {}) {
-  const request = await checkoutRequestRepo.findById(orgId, requestId);
-  if (!request) {
-    throw new NotFoundError('Request not found');
-  }
+  const request = await loadRequest(orgId, requestId);
 
-  const isRequester = String(request.requesterId) === String(actor.userId);
-  if (!isRequester && !roleHasPermission(actor.role, PERMISSIONS.REQUESTS_HANDOFF)) {
+  const actorIsRequester = isRequester(request, actor);
+  if (!actorIsRequester && !roleHasPermission(actor.role, PERMISSIONS.REQUESTS_HANDOFF)) {
     throw new ForbiddenError('Only the borrower or an approver can record this pickup');
   }
 
@@ -806,23 +893,23 @@ export async function checkout(orgId, actor, requestId, input = {}) {
   const { unitStatus } = assertTransition(request.state, S.CHECKED_OUT);
 
   return withTransaction(async (session) => {
-    const updated = await checkoutRequestRepo.transition(
+    // The other side recording the same pickup between our read and this write loses the
+    // compare-and-set, and hears that the item is already out rather than a state-machine message.
+    const updated = await commitTransition(
       orgId,
       requestId,
       {
+        from: request.state,
+        to: S.CHECKED_OUT,
         expectedState: S.APPROVED,
         patch: {
-          state: S.CHECKED_OUT,
           checkedOutAt: new Date(),
           dueAt: request.neededTo,
         },
+        conflictMessage: 'This item is already checked out',
       },
       { session },
     );
-    if (!updated) {
-      // The other side recorded the same pickup between our read and this write.
-      throw new ConflictError('This item is already checked out');
-    }
 
     await assetUnitRepo.updateStatus(orgId, updated.unitId, unitStatus, { session });
 
@@ -834,7 +921,7 @@ export async function checkout(orgId, actor, requestId, input = {}) {
         targetType: AUDIT_TARGET_TYPE.AssetUnit,
         targetId: updated.unitId,
         before: { status: U.HELD },
-        after: { status: unitStatus, selfReported: isRequester },
+        after: { status: unitStatus, selfReported: actorIsRequester },
         requestId: input.requestId,
       },
       { session },
@@ -865,21 +952,19 @@ export async function checkout(orgId, actor, requestId, input = {}) {
  * @throws {StateTransitionError} (409) the request isn't CHECKED_OUT/OVERDUE (including a lost race)
  */
 export async function initiateReturn(orgId, actor, requestId, input = {}) {
-  const request = await checkoutRequestRepo.findById(orgId, requestId);
-  if (!request || String(request.requesterId) !== String(actor.userId)) {
-    throw new NotFoundError('Request not found');
-  }
+  const request = await loadOwnRequest(orgId, actor, requestId);
 
   assertTransition(request.state, S.RETURN_PENDING);
 
   return withTransaction(async (session) => {
-    const updated = await checkoutRequestRepo.transition(
+    const updated = await commitTransition(
       orgId,
       requestId,
       {
+        from: request.state,
+        to: S.RETURN_PENDING,
         expectedState: request.state,
         patch: {
-          state: S.RETURN_PENDING,
           reportedCondition: input.condition,
           reportedNote: input.note ?? '',
           returnInitiatedAt: new Date(),
@@ -887,9 +972,6 @@ export async function initiateReturn(orgId, actor, requestId, input = {}) {
       },
       { session },
     );
-    if (!updated) {
-      throw new StateTransitionError(request.state, S.RETURN_PENDING);
-    }
 
     await auditService.record(
       orgId,
@@ -940,28 +1022,24 @@ export async function initiateReturn(orgId, actor, requestId, input = {}) {
  * @throws {StateTransitionError} (409) the request isn't CHECKED_OUT/OVERDUE/RETURN_PENDING (including a lost race)
  */
 export async function returnUnit(orgId, actor, requestId, input = {}) {
-  const request = await checkoutRequestRepo.findById(orgId, requestId);
-  if (!request) {
-    throw new NotFoundError('Request not found');
-  }
+  const request = await loadRequest(orgId, requestId);
 
   await assertMayConfirmReturn(orgId, request, actor);
   const { unitStatus } = assertTransition(request.state, S.RETURNED);
 
   return withTransaction(async (session) => {
     const { selfConfirmed } = await assertMayConfirmReturn(orgId, request, actor, { session });
-    const updated = await checkoutRequestRepo.transition(
+    const updated = await commitTransition(
       orgId,
       requestId,
       {
+        from: request.state,
+        to: S.RETURNED,
         expectedState: request.state,
-        patch: { state: S.RETURNED, returnedAt: new Date() },
+        patch: { returnedAt: new Date() },
       },
       { session },
     );
-    if (!updated) {
-      throw new StateTransitionError(request.state, S.RETURNED);
-    }
 
     await assetUnitRepo.updateStatusAndCondition(
       orgId,
@@ -1022,10 +1100,7 @@ export async function returnUnit(orgId, actor, requestId, input = {}) {
  * @throws {StateTransitionError} (409) the request isn't RETURN_PENDING (including a lost race)
  */
 export async function rejectReturn(orgId, actor, requestId, input = {}) {
-  const request = await checkoutRequestRepo.findById(orgId, requestId);
-  if (!request) {
-    throw new NotFoundError('Request not found');
-  }
+  const request = await loadRequest(orgId, requestId);
 
   await assertMayConfirmReturn(orgId, request, actor);
   if (request.state !== S.RETURN_PENDING) {
@@ -1041,13 +1116,14 @@ export async function rejectReturn(orgId, actor, requestId, input = {}) {
 
   return withTransaction(async (session) => {
     const { selfConfirmed } = await assertMayConfirmReturn(orgId, request, actor, { session });
-    const updated = await checkoutRequestRepo.transition(
+    const updated = await commitTransition(
       orgId,
       requestId,
       {
+        from: request.state,
+        to: S.CHECKED_OUT,
         expectedState: S.RETURN_PENDING,
         patch: {
-          state: S.CHECKED_OUT,
           reportedCondition: null,
           reportedNote: '',
           returnInitiatedAt: null,
@@ -1055,9 +1131,6 @@ export async function rejectReturn(orgId, actor, requestId, input = {}) {
       },
       { session },
     );
-    if (!updated) {
-      throw new StateTransitionError(request.state, S.CHECKED_OUT);
-    }
 
     await auditService.record(
       orgId,
