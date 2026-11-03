@@ -38,7 +38,7 @@
     "mongodb": "^7.6.0",
     "mongoose": "^9.10.1",
     "safedrop-code": "file:..",
-    "zod": "^4.6.5"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
